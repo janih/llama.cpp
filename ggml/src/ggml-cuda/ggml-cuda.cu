@@ -851,6 +851,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (size % 4 != 0 && stride_data % 4 == 0) {
+        // H2D 2D copies with a width not multiple of 4 take a pathologically slow
+        // path on ROCm (measured ~1000x slower: Q6_K/Q3_K quant blocks are 210/110
+        // bytes). Stage through device memory with an aligned width, then gather
+        // with an unaligned-width D2D copy (both fast). The source rows are
+        // 4-aligned (stride_data % 4 == 0), so the staging copy reads at most 3
+        // padding bytes past each row, staying inside the mapped source region.
+        const size_t width_aligned = (size + 3) & ~(size_t) 3;
+        char * tmp = nullptr;
+        CUDA_CHECK(cudaMalloc(&tmp, width_aligned * n_copies));
+        CUDA_CHECK(cudaMemcpy2DAsync(tmp, width_aligned, data, stride_data, width_aligned, n_copies,
+                cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, tmp, width_aligned,
+                size, n_copies, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(tmp));
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -3996,6 +4014,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+    static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
+
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+
     ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
@@ -4018,17 +4041,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_MUL) {
-        ggml_cuda_moe_weighted_reduction_match match;
-        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-            const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
-                ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
-                return match.node_count - 1;
-            }
-        }
-    }
 
     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
     // Q8_1 quantize into the norm kernel and pre-fill the matmul quantize
@@ -4670,7 +4682,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
+            if (!disable_moe_mmq && ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4817,6 +4829,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mul_node = cgraph->nodes[i + 1];
 
         const int out_nodes[] = { i + 1 };
+        // The x_scale_channel_dst kernel path scales by a per-(expert, token)
+        // vector of mm_node->ne[1]*mm_node->ne[2] values (topk weights).
         if (mul_node->op == GGML_OP_MUL &&
                 mul_node->src[0] == mm_node &&
                 (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
@@ -4825,12 +4839,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * weights = mul_node->src[1];
             if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
                     weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
+                    weights->ne[2] == mm_node->ne[2] &&
                     ggml_are_same_shape(mm_node, mul_node) &&
                     ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.x_scale             = weights;
                 fusion_data.x_scale_channel_dst = true;
-
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                 return 1;
             }
@@ -5224,7 +5238,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
     std::vector<cudaEvent_t> op_ev0;
     std::vector<cudaEvent_t> op_ev1;
-    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
+    std::vector<std::tuple<const ggml_tensor *, int, bool>> op_nodes;
     if (op_timing) {
         op_ev0.resize(cgraph->n_nodes);
         op_ev1.resize(cgraph->n_nodes);
@@ -5393,9 +5407,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (op_timing) {
+                    // bracket the fusion dispatch: a matching try_fuse launches its own
+                    // fused kernel and the per-node events below are skipped
+                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (op_timing) {
+                        CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+                        op_nodes.emplace_back(node, i, true);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5405,6 +5429,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     i += nodes_to_skip;
                     continue;
                 }
+
 #ifndef NDEBUG
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
@@ -5434,7 +5459,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (op_timing) {
                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
-                    op_nodes.emplace_back(node, i);
+                    op_nodes.emplace_back(node, i, false);
                 }
 
                 if (!is_concurrent_event_active) {
@@ -5494,14 +5519,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static std::map<std::string, int>    op_cnt_total;
         std::map<std::string, double> op_ms;
         std::map<std::string, int>    op_cnt;
-        for (const auto & [node, idx] : op_nodes) {
+        for (const auto & [node, idx, fused] : op_nodes) {
             float ms = 0.0f;
 #ifdef GGML_USE_HIP
             CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
 #else
             CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
 #endif
-            std::string key = ggml_op_name(node->op);
+            std::string key = fused ? "FUSED " : "";
+            key += ggml_op_name(node->op);
             key += " ";
             key += node->name;
             if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {

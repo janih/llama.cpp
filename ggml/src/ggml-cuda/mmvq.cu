@@ -967,7 +967,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_dst) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1007,6 +1007,11 @@ static __global__ void mul_mat_vec_q_moe(
         if constexpr (type == GGML_TYPE_NVFP4) {
             x_scale    = (const float *) fusion.x_scale;
             gate_scale = (const float *) fusion.gate_scale;
+        }
+        // Per-(expert, token) MoE scale (down x topk weights). Indexed by
+        // channel_dst + token_idx*nchannels_dst, one scalar per (expert, token).
+        if (fusion.x_scale_channel_dst) {
+            x_scale = (const float *) fusion.x_scale;
         }
     }
 
@@ -1070,6 +1075,9 @@ static __global__ void mul_mat_vec_q_moe(
                 if (x_scale) {
                     result *= x_scale[channel_x];
                 }
+            }
+            if (fusion.x_scale_channel_dst) {
+                result *= x_scale[channel_dst + token_idx * nchannels_dst];
             }
             if (x_bias) {
                 result += x_bias[bias_idx];
@@ -1181,13 +1189,13 @@ static void mul_mat_vec_q_moe_launch(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, nchannels_dst);
     } else {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+            ncols_dst, ids_stride, nchannels_dst);
     }
 }
 
@@ -1626,7 +1634,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
             if (fusion->x_scale_channel_dst) {
                 GGML_ASSERT(ids);
-                GGML_ASSERT(ggml_nelements(fusion->x_scale) == dst->ne[1]);
+                GGML_ASSERT(ggml_nelements(fusion->x_scale) == dst->ne[1] * dst->ne[2]);
             } else {
                 GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
             }
