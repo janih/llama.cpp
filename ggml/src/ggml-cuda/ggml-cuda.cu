@@ -4067,8 +4067,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (!consumes_mul) {
                     continue;
                 }
-                if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
+                if ((n->op == GGML_OP_MUL_MAT) &&
                         node->ne[0] % QK8_1 == 0 && ggml_cuda_should_fuse_mul_mat_vec_q(n)) {
+                    // MUL_MAT targets only: the pre-filled Q8_1 quantize cache
+                    // is consumed incorrectly by MUL_MAT_ID (expert-gathered)
+                    // matmuls - qwen35moe serving produced corrupted output with
+                    // the fold targeting MUL_MAT_ID (garbage at full speed on
+                    // 2x9070XT tensor+layer split; dense MUL_MAT targets are
+                    // verified bit-identical incl. spec-dec verify batches)
                     ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                     return 1;
                 }
