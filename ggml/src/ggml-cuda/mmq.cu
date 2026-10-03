@@ -118,7 +118,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
 
     ggml_prec prec = prec_env;
-    if (prec == GGML_PREC_UNDEFINED) {
+    // the fused gate+up+GLU dispatch passes the GLU node as dst; its op param 3 is the clamp limit, not a prec
+    if (prec == GGML_PREC_UNDEFINED && (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID)) {
         prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     }
 
