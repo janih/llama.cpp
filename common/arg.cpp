@@ -2735,6 +2735,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"-pmoe", "--cpu-moe-pinned"},
+        "keep the MoE expert weights in pinned host memory (implies --cpu-moe, needs enough locked memory)",
+        [](common_params & params) {
+            params.cpu_moe_pinned = true;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_CPU_MOE_PINNED"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

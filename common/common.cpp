@@ -1707,6 +1707,23 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.kv_overrides = params.kv_overrides.data();
     }
 
+    if (params.cpu_moe_pinned) {
+        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        auto * host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!host_buft) {
+            throw std::invalid_argument("no GPU host buffer type found for --cpu-moe-pinned");
+        }
+        for (auto & o : params.tensor_buft_overrides) {
+            if (o.pattern && std::string(o.pattern) == LLM_FFN_EXPS_REGEX && o.buft == ggml_backend_cpu_buffer_type()) {
+                o.buft = host_buft;
+            }
+        }
+        if (mparams.load_mode == LLAMA_LOAD_MODE_AUTO || mparams.load_mode == LLAMA_LOAD_MODE_MMAP || mparams.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+            LOG_INF("%s", "common: --cpu-moe-pinned reads the experts into pinned buffers, forcing load mode none\n");
+        }
+    }
+
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {
