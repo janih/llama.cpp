@@ -465,6 +465,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     cb(conv_input, "conv_input", il);
 
 
+    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
+
     return conv_input;
 }
 
